@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Shadows.</title>
+    <script src="../common/webgl-utils.js" charset="utf-8"></script>
+    <script src="../common/initShaders.js" charset="utf-8"></script>
+    <script src="../common/MV.js" charset="utf-8"></script>
+    <script src="../worksheet5/OBJParser.js " charset="utf-8"></script>
+    <script src="../libs/dat.gui.js" charset="utf-8"></script>
+    <script src="project.js" charset="utf-8"></script>
+    <script src="debug-fbo.js" charset="utf-8"></script>
+  </head>
+  <body style="background: #333; margin: 0; padding: 0; color: #fff; font-family: 'Helvetica Neue'; font-size: 10pt;">
+
+    <!-- DEBUG -->
+    <script id="vertex-shader-debug" type="x-shader/x-vertex">
+      precision mediump float;
+      precision highp int;
+
+      attribute vec4 vPosition;
+      attribute vec2 vTexCoord;
+
+      varying vec2 fTexCoord;
+
+      uniform sampler2D uSampler;
+
+      void main(void){
+        gl_Position = vPosition;
+        fTexCoord = vTexCoord;
+      }
+    </script>
+
+    <script id="fragment-shader-debug" type="x-shader/x-fragment">
+      precision mediump float;
+      precision highp int;
+
+      varying vec2 fTexCoord;
+      uniform sampler2D uSampler;
+
+      void main(void){
+        gl_FragColor = texture2D(uSampler, fTexCoord);
+      }
+    </script>
+    <!-- END DEBUG -->
+
+    <!-- FLOOR -->
+    <script id="vertex-shader-floor" type="x-shader/x-vertex">
+      precision mediump float;
+
+      attribute vec4 vPosition;
+      attribute vec2 vTexCoord;
+
+      varying vec2 fTexCoord;
+      varying vec3 v_PositionFromLight;
+
+      uniform sampler2D uSampler;
+      uniform sampler2D uShadowMap;
+
+      uniform mat4 modelViewMatrix;
+      uniform mat4 projectionMatrix;
+
+      uniform mat4 viewLightMatrix;
+      uniform mat4 projectionLightMatrix;
+
+      void main(void) {
+        vec4 lightPos = viewLightMatrix * vec4(vec3(vPosition), 1.0);
+        lightPos = projectionLightMatrix * lightPos;
+        vec3 lightPosDNC = lightPos.xyz / lightPos.w;
+        v_PositionFromLight = vec3(0.5, 0.5, 0.5) + lightPosDNC * 0.5;
+
+        fTexCoord = vTexCoord;
+        gl_Position = projectionMatrix * modelViewMatrix * vPosition;
+      }
+    </script>
+
+    <script id="fragment-shader-floor" type="x-shader/x-fragment">
+      precision mediump float;
+      precision highp int;
+
+      varying vec2 fTexCoord;
+      varying vec3 v_PositionFromLight;
+
+      uniform int shadow_type;
+      uniform bool debug_shadow;
+      uniform bool debug_vsm_shadow;
+      uniform bool use_filter;
+
+      uniform sampler2D uSampler;
+      uniform sampler2D uShadowMap;
+
+      float linstep(float low, float high, float v){
+        return clamp((v-low)/(high-low), 0.0, 1.0);
+      }
+
+      vec4 shadow_filter(vec2 uv_shadowMap){
+        if(!use_filter){
+          return texture2D(uShadowMap, uv_shadowMap);
+        }
+
+        vec3 result = vec3(0.0);
+
+        for(int x = -3; x <= 3; x++){
+          for(int y = -3; y <= 3; y++){
+            float x_l = (uv_shadowMap.x - float(x)/float(2048));
+            float y_l = (uv_shadowMap.y - float(y)/float(2048));
+            vec2 lookup = vec2(x_l, y_l);
+            result += texture2D(uShadowMap, lookup).rgb; //get(x,y);
+          }
+        }
+
+        return vec4((result/float(49.0)), 1.0);
+      }
+
+      void main(void){
+        vec2 uv_shadowMap = v_PositionFromLight.xy;
+        vec4 shadowMapColor = shadow_filter(uv_shadowMap);
+
+        float zShadowMap  = shadowMapColor.r;
+
+        if(debug_shadow && v_PositionFromLight.z > zShadowMap + 0.005){
+          // debug what's in shadow
+          gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0);
+          return;
+        }
+
+        // 1 = pcf, 2 = vsm, 3 = default
+        int mode = shadow_type;
+
+        float shadowCoeff = 0.0;
+        if(mode == 1){
+          // BEGIN PCF
+          float sum=0.0;
+          vec2 duv;
+
+          for(float pcf_x=-1.5; pcf_x<=1.5; pcf_x+=1.) {
+            for(float pcf_y=-1.5; pcf_y<=1.5; pcf_y+=1.) {
+              duv = vec2(pcf_x/2048., pcf_y/2048.);
+              sum+=shadow_filter(uv_shadowMap + duv).r;
+            }
+          }
+
+          sum = sum / 16.0;
+
+          shadowCoeff = v_PositionFromLight.z - sum;
+          shadowCoeff = 1.0 - (smoothstep(0.000, 0.085, shadowCoeff));
+
+          // shadowCoeff = 0 = shadow
+          // shadowCoeff = 1 = no shadow
+        } else if(mode == 2) {
+          // BEGIN VSM
+          float distance = v_PositionFromLight.z;
+          float mean = zShadowMap;
+          float depth_2 = shadowMapColor.g;
+          float variance = depth_2 - pow(mean, 2.00);
+          variance = max(variance, 0.005);
+
+          float p = smoothstep(distance - 0.02, distance, mean);
+          float d = distance - mean;
+
+          float p_max = linstep(0.2, 1.0, variance / (variance + d*d));
+          shadowCoeff = clamp(max(p, p_max), 0.0, 1.0);
+          // shadowCoeff = 0 = shadow
+          // shadowCoeff = 1 = no shadow
+
+          // VSM DEBUG:
+          if(debug_vsm_shadow == true){
+            float v = clamp(40.*variance, 0.00, 1.0);
+            gl_FragColor = vec4(0., v, 0., 1.);
+            return;
+          }
+        } else {
+          // BEGIN DEFAULT SHADOW MAPPING
+          shadowCoeff = 1. - smoothstep(0.005, 0.005, v_PositionFromLight.z - zShadowMap);
+        }
+
+        vec3 color   = vec3(texture2D(uSampler, fTexCoord));
+        gl_FragColor = vec4(color * shadowCoeff, 1.0);
+      }
+    </script>
+
+    <!-- TEAPOT -->
+    <script id="vertex-shader-teapot" type="x-shader/x-vertex">
+      precision mediump float;
+      precision highp int;
+
+      attribute vec3 vPosition;
+      attribute vec3 vNormal;
+
+      uniform mat4 modelViewMatrix;
+      uniform mat4 projectionMatrix;
+      uniform mat3 normalMatrix;
+
+      uniform vec3 lightPosition;
+
+      varying vec4 fColor;
+
+      void main(void){
+        vec3 pos = (modelViewMatrix * vec4(vPosition, 1.0)).xyz;
+
+        vec3 L =  normalize( lightPosition - pos );
+
+        // Transform vertex normal into eye coordinates
+        // normalize( normalMatrix * vNormal );
+        vec3 N =  normalize( vNormal * normalMatrix);
+        vec3 E = -normalize( pos );
+        vec3 H =  normalize( L + E );
+
+        vec4 ambient = vec4(0.0, 0.0, 0.0, 0.0);
+
+        float Kd = max( dot(L, N), 0.0 );
+        vec4 diffuse = Kd * vec4(0.9, 0.9, 0.9, 1.0);
+
+        float Ks = pow( max(dot(N, H), 0.0), 22.0 );
+        vec4 specular = Ks * vec4(1.0, 1.0, 1.0, 1.0);
+        if( dot(L, N) < 0.0 ) specular = vec4(0.0, 0.0, 0.0, 1.0);
+
+        fColor = ambient + diffuse + specular;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(vPosition, 1.0);
+      }
+    </script>
+
+    <script id="fragment-shader-teapot" type="x-shader/x-fragment">
+      precision mediump float;
+      precision highp int;
+
+      varying vec4 fColor;
+
+      void main(void){
+        gl_FragColor = fColor;
+      }
+    </script>
+
+    <!-- SHADOW -->
+    <script id="vertex-shader-shadow" type="x-shader/x-fragment">
+      precision mediump float;
+      attribute vec3 vPosition;
+      attribute vec3 vNormal;
+
+      varying float vDepth;
+
+      uniform mat4 modelViewMatrix;
+      uniform mat4 projectionMatrix;
+      uniform mat3 normalMatrix;
+
+      void main(void) {
+        vec4 position = projectionMatrix * modelViewMatrix * vec4(vPosition, 1.0);
+        float zBuf = position.z / position.w;  // between -1 and 1
+        vDepth = 0.5 + (zBuf * 0.5);           // between 0 and 1
+
+        gl_Position = position;
+      }
+    </script>
+
+    <script id="fragment-shader-shadow" type="x-shader/x-fragment">
+      
+      #extension GL_OES_standard_derivatives: enable
+
+      precision mediump float;
+      varying float vDepth;
+
+      void main(void) {
+        float depth2 = pow(vDepth, 2.0);
+
+        // approximate the spatial average of vDepth^2
+        float dx = dFdx(vDepth);
+        float dy = dFdy(vDepth);
+        float depth2Avg = depth2 + 0.50 * (dx*dx + dy*dy);
+
+        // depth saved in red channel while average depth^2 is
+        // stored in the green channel
+        gl_FragColor = vec4(vDepth, depth2Avg, 0., 1.);
+      }
+    </script>
+
+    <canvas id="gl-canvas" width="512" height="512">
+      Missing canvas support.
+    </canvas>
+  </body>
+</html>
